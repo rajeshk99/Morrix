@@ -748,9 +748,8 @@ function onMessage(event) {
 
   // ── GAME READY (from invite accept — server auto-created room) ──
   if (t==='game_ready') {
-    enterGame(data.symbol, data.code, data.session_token, data.opponent)
-    // Compute firstLabel AFTER enterGame() so playerSymbol is already set
     const firstLabel = data.first_turn === playerSymbol ? 'You go first!' : `${data.opponent || 'Opponent'} goes first!`
+    enterGame(data.symbol, data.code, data.session_token, data.opponent)
     document.getElementById('status').textContent = `Game starting! ${firstLabel}`
     return
   }
@@ -893,7 +892,7 @@ document.querySelector('svg').addEventListener('click', function(e) {
   const target = e.target.closest('[data-pos]'); if (!target) return
   const pos    = parseInt(target.dataset.pos)
   const placed = boardState.filter(v=>v!==null).length
-  if (placed < 6) { socket.send(JSON.stringify(pos)); return }
+  if (placed < 6) { socket.send(String(pos)); return }
   if (selected===null) {
     if (boardState[pos-1]===playerSymbol) {
       selected = pos

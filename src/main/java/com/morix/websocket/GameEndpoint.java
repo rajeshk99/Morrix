@@ -40,10 +40,6 @@ public class GameEndpoint {
     private static final ScheduledExecutorService SCHEDULER =
             Executors.newScheduledThreadPool(2);
 
-    // Registry: username -> their GameEndpoint instance (for cross-endpoint calls)
-    private static final java.util.concurrent.ConcurrentHashMap<String, GameEndpoint>
-            ENDPOINTS = new java.util.concurrent.ConcurrentHashMap<>();
-
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
     @OnOpen
@@ -54,6 +50,34 @@ public class GameEndpoint {
     @OnMessage
     public synchronized void onMessage(String raw, Session session) {
         try {
+            // Placement phase sends a plain number string e.g. "5"
+            // Handle it directly before trying to parse as JSON object
+            String trimmed = raw.trim();
+            if (inGameLoop && trimmed.matches("\\d+")) {
+                Room room = store.getRoom(roomCode);
+                if (room == null) return;
+                synchronized (room) {
+                    if (room.gameOver || !symbol.equals(room.turn)) return;
+                    if (room.placed < 6) {
+                        int pos = Integer.parseInt(trimmed);
+                        if (room.game.placePiece(pos, symbol)) {
+                            room.placed++;
+                            room.totalMoves++;
+                            if (room.game.checkWin(symbol)) {
+                                room.gameOver = true;
+                                String loser = room.opponentUsername(symbol);
+                                broadcast(room, obj().put("type", "win").put("player", symbol));
+                                saveGameAsync(username, loser, room.totalMoves, false, room);
+                            } else {
+                                room.turn = "X".equals(room.turn) ? "O" : "X";
+                                broadcastBoard(room);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
             JSONObject msg = new JSONObject(raw);
             String action  = msg.optString("action", "");
 
@@ -75,7 +99,6 @@ public class GameEndpoint {
     public synchronized void onClose(Session session, CloseReason reason) {
         if (username != null && store.getOnline(username) == session) {
             store.removeOnline(username);
-            ENDPOINTS.remove(username);
             notifyFriendsStatusChange(username);
         }
 
@@ -125,7 +148,6 @@ public class GameEndpoint {
                 DB.createUser(u, DB.hashPassword(p));
                 username = u;
                 store.putOnline(username, session);
-                ENDPOINTS.put(username, this);
                 String tok = store.createAuthToken(username);
                 send(session, obj().put("type","registered").put("username",u)
                         .put("auth_token",tok).put("friends",new JSONArray()).put("statuses",new JSONObject()));
@@ -142,7 +164,6 @@ public class GameEndpoint {
                     { send(session, err("Invalid username or password.")); return; }
                 username = u;
                 store.putOnline(username, session);
-                ENDPOINTS.put(username, this);
                 String tok = store.createAuthToken(username);
                 List<String> friends = DB.getFriends(u);
                 JSONObject statuses  = buildStatuses(friends);
@@ -161,7 +182,6 @@ public class GameEndpoint {
                     { send(session, err("Session expired. Please log in again.")); return; }
                 username = u;
                 store.putOnline(username, session);
-                ENDPOINTS.put(username, this);
                 List<String> friends = DB.getFriends(u);
                 JSONObject statuses  = buildStatuses(friends);
                 // Check for active game
@@ -316,27 +336,9 @@ public class GameEndpoint {
             if (room.gameOver || !symbol.equals(room.turn)) return;
         }
 
-        // ── Placement phase ──────────────────────────────────────────────────
+        // ── Placement phase ─ handled in onMessage for plain number strings ───
         synchronized (room) {
-            if (room.placed < 6) {
-                try {
-                    int pos = new JSONObject("{\"v\":" + raw + "}").getInt("v");
-                    if (room.game.placePiece(pos, symbol)) {
-                        room.placed++;
-                        room.totalMoves++;
-                        if (room.game.checkWin(symbol)) {
-                            room.gameOver = true;
-                            String loser  = room.opponentUsername(symbol);
-                            broadcast(room, obj().put("type","win").put("player",symbol));
-                            saveGameAsync(username, loser, room.totalMoves, false, room);
-                        } else {
-                            room.turn = "X".equals(room.turn) ? "O" : "X";
-                            broadcastBoard(room);
-                        }
-                    }
-                } catch (Exception ignored) {}
-                return;
-            }
+            if (room.placed < 6) return; // plain number already handled above
         }
 
         // ── Movement phase ───────────────────────────────────────────────────
@@ -425,34 +427,28 @@ public class GameEndpoint {
 
             case "accept_invite": {
                 if (username == null) return true;
-                String inviter    = msg.optString("from","");
+                String inviter   = msg.optString("from","");
                 Session inviterWs = store.getOnline(inviter);
                 if (inviterWs == null) {
                     send(session, err(inviter + " went offline."));
                     return true;
                 }
-                GameEndpoint inviterEp = ENDPOINTS.get(inviter);
-                if (inviterEp == null) {
-                    send(session, err(inviter + " went offline."));
-                    return true;
-                }
-
                 // Create the room
-                String code  = store.generateCode();
-                String first = randomFirst();
-                Room room    = new Room(code, inviterWs, inviter, first);
-                room.players[1]   = session;
+                String code   = store.generateCode();
+                String first  = randomFirst();
+                Room room     = new Room(code, inviterWs, inviter, first);
+                room.players[1]  = session;
                 room.usernames[1] = username;
                 store.putRoom(code, room);
 
                 String tokX = store.createGameSession("X", code, inviter);
                 String tokO = store.createGameSession("O", code, username);
 
-                // ── Directly transition the inviter's endpoint into game mode ──
-                // This is the critical fix: the Python server used an async event
-                // to break the inviter out of lobby loop. In Java we do it directly
-                // by calling a synchronized method on their GameEndpoint instance.
-                inviterEp.activateGame("X", code, tokX);
+                // Signal inviter's endpoint (it's in lobby, waiting)
+                // We set the pending game and call a synthetic "accept" flow.
+                // Since each WS connection runs in its own GameEndpoint,
+                // we find the inviter's endpoint via a shared pending-game signal.
+                store.setPendingGame(inviter, new String[]{ code, "X", tokX, username });
 
                 // Send game_ready to inviter
                 safeSend(inviterWs, obj().put("type","game_ready")
@@ -460,13 +456,13 @@ public class GameEndpoint {
                         .put("session_token",tokX).put("opponent",username)
                         .put("first_turn",first));
 
-                // Set up this (accepter) endpoint
+                // Set up joiner (this endpoint)
                 this.roomCode     = code;
                 this.symbol       = "O";
                 this.sessionToken = tokO;
                 this.inGameLoop   = true;
 
-                // Send game_ready + start + board to accepter
+                // Send game_ready + start + board to joiner
                 send(session, obj().put("type","game_ready")
                         .put("code",code).put("symbol","O")
                         .put("session_token",tokO).put("opponent",inviter)
@@ -493,14 +489,6 @@ public class GameEndpoint {
     }
 
     // ── Helpers ──────────────────────────────────────────────────────────────
-
-    /** Called by the accepter's thread to transition THIS endpoint into game mode. */
-    public synchronized void activateGame(String sym, String code, String token) {
-        this.symbol       = sym;
-        this.roomCode     = code;
-        this.sessionToken = token;
-        this.inGameLoop   = true;
-    }
 
     private void broadcastBoard(Room room) {
         String[] board = room.game.getBoard();
