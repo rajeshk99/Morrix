@@ -892,7 +892,7 @@ document.querySelector('svg').addEventListener('click', function(e) {
   const target = e.target.closest('[data-pos]'); if (!target) return
   const pos    = parseInt(target.dataset.pos)
   const placed = boardState.filter(v=>v!==null).length
-  if (placed < 6) { socket.send(String(pos)); return }
+  if (placed < 6) { socket.send(JSON.stringify(pos)); return }
   if (selected===null) {
     if (boardState[pos-1]===playerSymbol) {
       selected = pos
