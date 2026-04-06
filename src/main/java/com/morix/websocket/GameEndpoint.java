@@ -50,6 +50,34 @@ public class GameEndpoint {
     @OnMessage
     public synchronized void onMessage(String raw, Session session) {
         try {
+            // Placement phase sends a plain number string e.g. "5"
+            // Handle it directly before trying to parse as JSON object
+            String trimmed = raw.trim();
+            if (inGameLoop && trimmed.matches("\\d+")) {
+                Room room = store.getRoom(roomCode);
+                if (room == null) return;
+                synchronized (room) {
+                    if (room.gameOver || !symbol.equals(room.turn)) return;
+                    if (room.placed < 6) {
+                        int pos = Integer.parseInt(trimmed);
+                        if (room.game.placePiece(pos, symbol)) {
+                            room.placed++;
+                            room.totalMoves++;
+                            if (room.game.checkWin(symbol)) {
+                                room.gameOver = true;
+                                String loser = room.opponentUsername(symbol);
+                                broadcast(room, obj().put("type", "win").put("player", symbol));
+                                saveGameAsync(username, loser, room.totalMoves, false, room);
+                            } else {
+                                room.turn = "X".equals(room.turn) ? "O" : "X";
+                                broadcastBoard(room);
+                            }
+                        }
+                    }
+                }
+                return;
+            }
+
             JSONObject msg = new JSONObject(raw);
             String action  = msg.optString("action", "");
 
@@ -308,27 +336,9 @@ public class GameEndpoint {
             if (room.gameOver || !symbol.equals(room.turn)) return;
         }
 
-        // ── Placement phase ──────────────────────────────────────────────────
+        // ── Placement phase ─ handled in onMessage for plain number strings ───
         synchronized (room) {
-            if (room.placed < 6) {
-                try {
-                    int pos = Integer.parseInt(raw.trim());
-                    if (room.game.placePiece(pos, symbol)) {
-                        room.placed++;
-                        room.totalMoves++;
-                        if (room.game.checkWin(symbol)) {
-                            room.gameOver = true;
-                            String loser  = room.opponentUsername(symbol);
-                            broadcast(room, obj().put("type","win").put("player",symbol));
-                            saveGameAsync(username, loser, room.totalMoves, false, room);
-                        } else {
-                            room.turn = "X".equals(room.turn) ? "O" : "X";
-                            broadcastBoard(room);
-                        }
-                    }
-                } catch (Exception ignored) {}
-                return;
-            }
+            if (room.placed < 6) return; // plain number already handled above
         }
 
         // ── Movement phase ───────────────────────────────────────────────────
