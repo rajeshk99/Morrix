@@ -312,7 +312,7 @@ public class GameEndpoint {
         synchronized (room) {
             if (room.placed < 6) {
                 try {
-                    int pos = new JSONObject("{\"v\":" + raw + "}").getInt("v");
+                    int pos = Integer.parseInt(raw.trim());
                     if (room.game.placePiece(pos, symbol)) {
                         room.placed++;
                         room.totalMoves++;
